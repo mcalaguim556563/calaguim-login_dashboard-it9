@@ -1,0 +1,280 @@
+STEPS
+composer create-project laravel/laravel clinic-system
+cd clinic-system
+composer require laravel/breeze --dev
+php artisan breeze:install blade --no-interaction
+npm install
+npm run build
+composer require barryvdh/laravel-dompdf
+composer require phpoffice/phpspreadsheet --ignore-platform-reqs
+php artisan make:migration create_appointments_table
+php artisan make:model Appointment
+php artisan make:controller AppointmentController --resource
+php artisan make:controller AppointmentReportController
+php artisan migrate:fresh --seed --force
+php artisan serve --port=8000
+
+.env
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=clinic_db
+DB_USERNAME=root
+DB_PASSWORD=
+
+database/migrations/xxxx_create_appointments_table.php
+<?php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::create('appointments', function (Blueprint $table) {
+            $table->id();
+            $table->string('patient_name');
+            $table->string('doctor_name');
+            $table->integer('session_count')->default(1);
+            $table->enum('status', ['scheduled', 'completed', 'cancelled'])->default('scheduled');
+            $table->date('appointment_date');
+            $table->text('notes')->nullable();
+            $table->timestamps();
+        });
+    }
+    public function down(): void
+    {
+        Schema::dropIfExists('appointments');
+    }
+};
+
+app/Models/Appointment.php
+<?php
+namespace App\Models;
+use Illuminate\Database\Eloquent\Model;
+class Appointment extends Model
+{
+    protected $fillable = [
+        'patient_name',
+        'doctor_name',
+        'session_count',
+        'status',
+        'appointment_date',
+        'notes',
+    ];
+    protected $casts = [
+        'appointment_date' => 'date',
+    ];
+}
+
+app/Http/Controllers/AppointmentController.php
+<?php
+namespace App\Http\Controllers;
+use App\Models\Appointment;
+use Illuminate\Http\Request;
+class AppointmentController extends Controller
+{
+    public function index()
+    {
+        $appointments = Appointment::latest()->paginate(10);
+        return view('appointments.index', compact('appointments'));
+    }
+    public function create()
+    {
+        return view('appointments.create');
+    }
+    public function store(Request $request)
+    {
+        $request->validate([
+            'patient_name' => 'required|string|max:255',
+            'doctor_name' => 'required|string|max:255',
+            'session_count' => 'required|integer|min:1',
+            'status' => 'required|in:scheduled,completed,cancelled',
+            'appointment_date' => 'required|date',
+            'notes' => 'nullable|string',
+        ]);
+        Appointment::create($request->all());
+        return redirect()->route('appointments.index')->with('success', 'Record added!');
+    }
+    public function edit(Appointment $appointment)
+    {
+        return view('appointments.edit', compact('appointment'));
+    }
+    public function update(Request $request, Appointment $appointment)
+    {
+        $request->validate([
+            'patient_name' => 'required|string|max:255',
+            'doctor_name' => 'required|string|max:255',
+            'session_count' => 'required|integer|min:1',
+            'status' => 'required|in:scheduled,completed,cancelled',
+            'appointment_date' => 'required|date',
+            'notes' => 'nullable|string',
+        ]);
+        $appointment->update($request->all());
+        return redirect()->route('appointments.index')->with('success', 'Record updated!');
+    }
+    public function destroy(Appointment $appointment)
+    {
+        $appointment->delete();
+        return redirect()->route('appointments.index')->with('success', 'Record deleted!');
+    }
+}
+
+app/Http/Controllers/AppointmentReportController.php
+<?php
+namespace App\Http\Controllers;
+use App\Models\Appointment;
+use Barryvdh\DomPDF\Facade\Pdf;
+class AppointmentReportController extends Controller
+{
+    private function getStats()
+    {
+        $doctors = Appointment::select('doctor_name')->distinct()->pluck('doctor_name');
+        $summary = [];
+        foreach ($doctors as $doctor) {
+            $summary[$doctor] = [
+                'total' => Appointment::where('doctor_name', $doctor)->sum('session_count'),
+                'scheduled' => Appointment::where('doctor_name', $doctor)->where('status', 'scheduled')->sum('session_count'),
+                'completed' => Appointment::where('doctor_name', $doctor)->where('status', 'completed')->sum('session_count'),
+                'cancelled' => Appointment::where('doctor_name', $doctor)->where('status', 'cancelled')->sum('session_count'),
+            ];
+        }
+        return [
+            'totalRecords' => Appointment::count(),
+            'totalScheduled' => Appointment::where('status', 'scheduled')->sum('session_count'),
+            'totalCompleted' => Appointment::where('status', 'completed')->sum('session_count'),
+            'totalCancelled' => Appointment::where('status', 'cancelled')->sum('session_count'),
+            'doctorSummary' => $summary,
+            'appointments' => Appointment::latest()->get(),
+        ];
+    }
+    public function index()
+    {
+        return view('appointment-reports.index', $this->getStats());
+    }
+    public function exportPdf()
+    {
+        $data = $this->getStats();
+        $data['dateGenerated'] = now()->format('F d, Y h:i A');
+        $pdf = Pdf::loadView('appointment-reports.pdf', $data)->setPaper('a4', 'landscape');
+        return $pdf->download('appointment-report-' . now()->format('Y-m-d') . '.pdf');
+    }
+    public function exportExcel()
+    {
+        $appointments = Appointment::latest()->get();
+        $spreadsheet = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setCellValue('A1', 'Clinic Appointment Report - ' . now()->format('F d, Y'));
+        $sheet->mergeCells('A1:G1');
+        $headers = ['#', 'Patient Name', 'Doctor Name', 'Sessions', 'Status', 'Appointment Date', 'Notes'];
+        foreach ($headers as $col => $h) {
+            $sheet->setCellValueByColumnAndRow($col + 1, 3, $h);
+        }
+        foreach ($appointments as $i => $a) {
+            $row = $i + 4;
+            $sheet->setCellValueByColumnAndRow(1, $row, $i + 1);
+            $sheet->setCellValueByColumnAndRow(2, $row, $a->patient_name);
+            $sheet->setCellValueByColumnAndRow(3, $row, $a->doctor_name);
+            $sheet->setCellValueByColumnAndRow(4, $row, $a->session_count);
+            $sheet->setCellValueByColumnAndRow(5, $row, ucfirst($a->status));
+            $sheet->setCellValueByColumnAndRow(6, $row, $a->appointment_date->format('Y-m-d'));
+            $sheet->setCellValueByColumnAndRow(7, $row, $a->notes ?? '');
+        }
+        $writer = new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($spreadsheet);
+        return response()->streamDownload(function () use ($writer) {
+            $writer->save('php://output');
+        }, 'appointment-report-' . now()->format('Y-m-d') . '.xlsx', [
+            'Content-Type' => 'application/vnd.openxmlformatsofficedocument.spreadsheetml.sheet',
+        ]);
+    }
+}
+
+routes/web.php
+<?php
+use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\AppointmentController;
+use App\Http\Controllers\AppointmentReportController;
+use Illuminate\Support\Facades\Route;
+Route::get('/', fn() => redirect()->route('dashboard'));
+Route::get('/dashboard', function () {
+    return view('dashboard', [
+        'totalRecords' => \App\Models\Appointment::count(),
+        'totalScheduled' => \App\Models\Appointment::where('status', 'scheduled')->sum('session_count'),
+        'totalCompleted' => \App\Models\Appointment::where('status', 'completed')->sum('session_count'),
+        'totalCancelled' => \App\Models\Appointment::where('status', 'cancelled')->sum('session_count'),
+    ]);
+})->middleware(['auth', 'verified'])->name('dashboard');
+Route::middleware('auth')->group(function () {
+    Route::get('/profile', [ProfileController::class, 'edit'])->name('profile.edit');
+    Route::patch('/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::delete('/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+    Route::resource('appointments', AppointmentController::class);
+    Route::get('/appointment-reports', [AppointmentReportController::class, 'index'])->name('appointment-reports.index');
+    Route::get('/appointment-reports/pdf', [AppointmentReportController::class, 'exportPdf'])->name('appointment-reports.pdf');
+    Route::get('/appointment-reports/excel', [AppointmentReportController::class, 'exportExcel'])->name('appointment-reports.excel');
+});
+require __DIR__.'/auth.php';
+
+database/seeders/DatabaseSeeder.php
+<?php
+namespace Database\Seeders;
+use Illuminate\Database\Seeder;
+use App\Models\User;
+use App\Models\Appointment;
+class DatabaseSeeder extends Seeder
+{
+    public function run(): void
+    {
+        User::firstOrCreate(
+            ['email' => 'admin@clinic.com'],
+            ['name' => 'Admin User', 'password' => bcrypt('password')]
+        );
+        $records = [
+            ['patient_name' => 'Juan Cruz', 'doctor_name' => 'Dr. Santos', 'session_count' => 1, 'status' => 'scheduled', 'appointment_date' => '2026-05-01', 'notes' => 'Checkup'],
+            ['patient_name' => 'Maria Reyes', 'doctor_name' => 'Dr. Santos', 'session_count' => 2, 'status' => 'completed', 'appointment_date' => '2026-05-02', 'notes' => null],
+            ['patient_name' => 'Pedro Diaz', 'doctor_name' => 'Dr. Lim', 'session_count' => 1, 'status' => 'cancelled', 'appointment_date' => '2026-05-03', 'notes' => 'Reschedule'],
+            ['patient_name' => 'Ana Lopez', 'doctor_name' => 'Dr. Lim', 'session_count' => 1, 'status' => 'scheduled', 'appointment_date' => '2026-05-04', 'notes' => null],
+            ['patient_name' => 'Carlos Ramos', 'doctor_name' => 'Dr. Uy', 'session_count' => 3, 'status' => 'completed', 'appointment_date' => '2026-05-05', 'notes' => 'Therapy'],
+        ];
+        foreach ($records as $r) {
+            Appointment::create($r);
+        }
+    }
+}
+
+resources/views/appointments/index.blade.php
+
+resources/views/appointments/create.blade.php
+
+resources/views/appointments/edit.blade.php
+
+resources/views/appointment-reports/index.blade.php
+
+resources/views/appointment-reports/pdf.blade.php
+
+<h2>Clinic Appointment Report</h2>
+<table>
+    <thead>
+        <tr>
+            <th>Doctor</th>
+            <th>Total</th>
+            <th>Scheduled</th>
+            <th>Completed</th>
+            <th>Cancelled</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach ($doctorSummary as $doctor => $row)
+        <tr>
+            <td>{{ $doctor }}</td>
+            <td>{{ $row['total'] }}</td>
+            <td>{{ $row['scheduled'] }}</td>
+            <td>{{ $row['completed'] }}</td>
+            <td>{{ $row['cancelled'] }}</td>
+        </tr>
+        @endforeach
+    </tbody>
+</table>
+
+resources/views/dashboard.blade.php
+add this .txt file
